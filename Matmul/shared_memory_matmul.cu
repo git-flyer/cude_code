@@ -28,25 +28,33 @@ __global__ void shared_memory_matmul_kernel(const float *A, const float *B, floa
 
     float sum = 0.;
 
-    for(int k_offset = 0; k < K; k += BK){
+    for(int k_0 = 0; k_0 < K; k_0 += BK){
 
-        if(row < M && k + t_x < K && t_x < BK){
-            As[t_y][t_x] = A[row * K + k + t_x];
+        if(row < M && k_0 + t_x < K && t_x < BK){
+            As[t_y][t_x] = A[row * K + k_0 + t_x];
         }
         else{
             As[t_y][t_x] = 0;
         }
-        if(col < N && k + t_y < K && t_y < BK){
-            Bs[t_y][t_x] = B[col + (k + t_y) * N]
+        if(col < N && k_0 + t_y < K && t_y < BK){
+            Bs[t_y][t_x] = B[col + (k_0 + t_y) * N];
         }
         else{
             Bs[t_y][t_x] = 0;
         }
-        __synthreads();
+        __syncthreads();
         // 确保线程块内的所有线程都完成了As和Bs矩阵的加载工作
 
+        for(int k = 0; k < BK; ++k){
+            sum += As[t_y][k] * Bs[k][t_x];
+        }
+        __syncthreads();
+        // 确保线程块内的所有线程都已经完成了sum值的一次累加
+        // 之后再进行 As 和 Bs 的搬运工作
     }
 
+    if(row < M && col < N)
+        C[row * N + col] = sum;
 
 }
 
