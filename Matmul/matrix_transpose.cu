@@ -7,8 +7,8 @@ using std::cout;
 using std::endl;
 
 
-
-__global__ void naiveTrans(float *d_output, float *d_input, int M, int N){
+// naive版本的矩阵转置，row版本，原始矩阵按行读取，转置后的矩阵按列写入
+__global__ void naiveTransRow(float *d_output, float *d_input, int M, int N){
     // 输入矩阵是M* N的，M是行，N是列
     // 目的是把M * N 的矩阵转置成N * M;
     int tx = threadIdx.x, ty = threadIdx.y;
@@ -17,6 +17,28 @@ __global__ void naiveTrans(float *d_output, float *d_input, int M, int N){
     int y = by * blockDim.y + ty;
     if(x < N && y < M){
         d_output[x * M + y] = d_input[y * N + x];
+    }
+}
+
+// 进阶版本的矩阵转置，col版本，原始矩阵按列读取，转置后的矩阵按行写入
+// Bm是tile数据的行大小，Bn是列, 一般Bm要是blockDim.x的整数倍
+// Bn要是blockDim.y的整数倍
+template <int Bm, int Bn>
+__global__ void naiveTransColNelements(float *d_output, float *d_input, int M, int N){
+    // (r,c)代表tile数据左上角元素的坐标
+    int r = blockIdx.x * Bm, c = blockIdx.y * Bn;
+    int bx = blockDim.x, by = blockDim.y;
+    int tx = threadIdx.x, ty = threadIdx.y;
+    for(int i = tx; i < Bm; i += bx){
+        int r0 = r + i;
+        if(r0 >= M)
+            break;
+        for(int j = ty; j < Bn; j += by){
+            int c0 = c + j;
+            if(c0 < N){
+                d_output[c0 * M + r0] = d_input[r0 * N + c0];
+            }
+        }
     }
 }
 
@@ -35,15 +57,16 @@ __global__ void SmemTrans_B_SZ(const float* idata, float* odata, int M, int N) {
     if (y < M && x < N) {
         sdata[ty][tx] = idata[y * N + x];
     }
-    __syncthreads();
+    __syncthreads();  // 到这里搬运了所有原矩阵的数据到smem里
 
-    x = by * BLOCK_SZ + ty;
-    y = bx * BLOCK_SZ + tx;
-    if (y < N && x < M) {
-        odata[y * M + x] = sdata[ty][tx];
+    x = by * BLOCK_SZ + tx;
+    y = bx * BLOCK_SZ + ty;
+    if (y < N && x < M) {    // 原始矩阵是按行搬运进smem的，这里按行写入odata，则应该按列读取smem
+        odata[y * M + x] = sdata[tx][ty];
     }
 }
 
+//
 template <int BLOCK_SZ_M, int BLOCK_SZ_N>
 __global__ void SmemTrans(float *d_output, const float *d_input, int M, int N) {
     // 1. 定义共享内存 (无 Padding)
@@ -85,9 +108,10 @@ __global__ void SmemTrans(float *d_output, const float *d_input, int M, int N) {
 }
 
 void call_naiveTrans(float *d_output, float *d_input, int M, int N){
-    dim3 blockDim(16, 16);
+    dim3 blockDim(8, 8);
     dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
-    naiveTrans<<<gridDim, blockDim>>>(d_output, d_input, M, N);
+    // naiveTransRow<<<gridDim, blockDim>>>(d_output, d_input, M, N);
+    naiveTransColNelements<16, 16><<<gridDim, blockDim>>>(d_output, d_input, M, N);
 }
 
 void call_SmemTrans(float *d_output, float *d_input, int M, int N){
