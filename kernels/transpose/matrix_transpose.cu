@@ -50,7 +50,7 @@ __global__ void naiveTransColNelements(float *d_output, float *d_input, int M, i
 // 这里 BLOCK_SZ 的大小应该等于blockDim.x，也等于blockDim.y
 // 线程块必须开的是方阵，否则sdata访问会越界
 template <int BLOCK_SZ>
-__global__ void SmemTrans_B_SZ(const float* idata, float* odata, int M, int N) {
+__global__ void SmemTrans_B_SZ(float *d_output, float *d_input, int M, int N) {
     const int bx = blockIdx.x, by = blockIdx.y;
     const int tx = threadIdx.x, ty = threadIdx.y;
 
@@ -60,14 +60,14 @@ __global__ void SmemTrans_B_SZ(const float* idata, float* odata, int M, int N) {
     int y = by * BLOCK_SZ + ty;
 
     if (y < M && x < N) {
-        sdata[ty][tx] = idata[y * N + x];
+        sdata[ty][tx] = d_input[y * N + x];
     }
     __syncthreads();  // 到这里搬运了所有原矩阵的数据到smem里
 
     x = by * BLOCK_SZ + tx;
     y = bx * BLOCK_SZ + ty;
     if (y < N && x < M) {    // 原始矩阵是按行搬运进smem的，这里按行写入odata，则应该按列读取smem
-        odata[y * M + x] = sdata[tx][ty];
+        d_output[y * M + x] = sdata[tx][ty];
     }
 }
 
@@ -115,6 +115,73 @@ __global__ void SmemTrans(float *d_output, const float *d_input, int M, int N) {
     }
 }
 
+
+
+// 一个线程处理多个矩阵元素的版本，因为
+// 一个矩阵可以处理多个矩阵元素的转置操作
+// 因此不需要对一个线程块中的线程坐标进行重新排布了
+// 因为不需要满足
+template <int Bm, int Bn>
+__global__ void SmemTrans_MultiElem(float *d_output, float *d_input, int M, int N){
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int bx = blockIdx.x, by = blockIdx.y;
+    int r = Bm * by, c = Bn * bx;
+    // __shared__ float tile[Bm][Bn];
+    __shared__ float tile[Bm][Bn + 1];
+    for(int i = ty; i < Bm; i += blockDim.y){
+        int r_0 = r + i;
+        if(r_0 < M){
+            for(int j = tx; j < Bn; j += blockDim.x){
+                int c_0 = c + j;
+                if(c_0 < N){
+                    tile[i][j] = d_input[r_0 * N + c_0];
+                }
+            }
+        }
+    }
+    __syncthreads();
+    // 至此加载了input矩阵中的所有元素到shared_memory
+    // 接下来从shared_memory 中将数据加载到output矩阵中
+    // 输入矩阵是 M * N 的，输出矩阵是 N * M 的
+    for(int i = ty; i < Bn; i += blockDim.y){
+        int r_1 = c + i;
+        if(r_1 < N){
+            for(int j = tx; j < Bm; j += blockDim.x){
+                int c_1 = r + j;
+                if(c_1 < M){
+                    d_output[r_1 * M + c_1] = tile[j][i];
+                }
+            }
+        }
+    }
+}
+
+__global__ void SmemTrans_Swizzling(float *d_output, float *d_input, int M, int N){
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int bx = blockIdx.x, by = blockIdx.y;
+    __shared__ float tile[32][32];
+    int x = bx * blockDim.x + tx, y = by * blockDim.y + ty;
+
+    // 原矩阵A中的元素被加载到tile矩阵之后
+    // 物理行等于逻辑行（物理列等于  逻辑行 ^ 逻辑列）
+    // 相当于本来应该存在 tile[ty][tx] 的元素现在被存到了
+    // tile[ty][tx ^ ty]，这样下次按逻辑列读取tile[ty][tx]
+    // 的时候去tile[ty][tx ^ ty]找这个元素，这样就不会发生bank conflict了
+    if(x < N && y < M){
+        tile[ty][tx ^ ty] = d_input[y * N + x];
+    }
+    __syncthreads();
+    // 至此按行搬运了所有元素到shared_memory
+    // 接下来按逻辑列读取tile中的元素，按行写到
+    // 矩阵B中
+
+    int newx = by * blockDim.y + tx;
+    int newy = bx * blockDim.x + ty;
+    if(newx < M && newy < N){
+        d_output[newy * M + newx] = tile[tx][tx ^ ty];
+    }
+}
+
 void call_naiveTrans(float *d_output, float *d_input, int M, int N){
     dim3 blockDim(8, 8);
     dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
@@ -123,10 +190,12 @@ void call_naiveTrans(float *d_output, float *d_input, int M, int N){
 }
 
 void call_SmemTrans(float *d_output, float *d_input, int M, int N){
-    dim3 blockDim(4, 2);
+    dim3 blockDim(8, 8);
     dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
     // SmemTrans_B_SZ<16><<<gridDim, blockDim>>>(d_output, d_input, M, N);
-    SmemTrans<4, 2><<<gridDim, blockDim>>>(d_output, d_input, M, N);
+    // SmemTrans<4, 2><<<gridDim, blockDim>>>(d_output, d_input, M, N);
+    // SmemTrans_MultiElem<32, 8><<<gridDim, blockDim>>>(d_output, d_input, M, N);
+    SmemTrans_Swizzling<<<gridDim, blockDim>>>(d_output, d_input, M, N);
 }
 
 int main(){
