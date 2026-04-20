@@ -92,6 +92,59 @@ __global__ void row_rmsnorm_f32_dim(float *in, float *weight, float *out, int ba
     }
 }
 
+// simd 版本，一个线程负责加载多个数据
+__global__ void row_rmsnorm_f32_dim_simd(float *in, float *weight, float *out, int batch, int size, float eps){
+    // 数据的形状是 batch * size
+    int bx = blockIdx.x, tid = threadIdx.x;
+    if(bx >= batch)
+        return;
+    float *block_in = in + bx * size;  
+    float *block_out = out + bx * size;
+
+    float sum = 0.0f;
+    int pack_size = 4;   // 打包，一次传输4个数据
+    int pack_num = size / pack_size;    // 能装几包数据
+    int pack_off = pack_num * pack_size;
+
+    float4 *in_pack = reinterpret_cast<float4 *>(block_in);
+    for(int i = tid; i < pack_num; i += blockDim.x){
+        float4 in_float4 = *(in_pack + i);
+        sum += in_float4.x * in_float4.x;
+        sum += in_float4.y * in_float4.y;
+        sum += in_float4.z * in_float4.z;
+        sum += in_float4.w * in_float4.w;
+    }
+
+    // 前几个线程参与最后不足一个pack的数据的搬运工作
+    for(int i = tid + pack_off; i < size; i += blockDim.x){
+        sum += block_in[i] * block_in[i];
+    }
+
+    __shared__ float shared_val;
+    sum = block_reduce(sum);
+    if(threadIdx.x == 0)
+        shared_val = sum;    // 0号线程的计算结果被写入shared_val;
+    __syncthreads();     // 确保0号线程的计算结果已经被写入shared_val;
+    sum = shared_val;   // 所有线程都得到了一个 size 大小数据块的归约结果
+    const float scale = rsqrtf(sum / static_cast<float>(size) + eps);
+    float4 *out_pack = reinterpret_cast<float4 *>(block_out);
+    float4 *wei_pack = reinterpret_cast<float4 *>(weight);
+
+    for(int i = tid; i < pack_num; i += blockDim.x){
+        float4 *out_float4 = out_pack + i;
+        float4 *in_float4 = in_pack + i;
+        float4 *wei_float4 = wei_pack + i;
+        out_float4->x = in_float4->x * scale * wei_float4->x;
+        out_float4->y = in_float4->y * scale * wei_float4->y;
+        out_float4->z = in_float4->z * scale * wei_float4->z;
+        out_float4->w = in_float4->w * scale * wei_float4->w;
+    }
+
+    for(int i = tid + pack_off; i < size; i += blockDim.x){
+        block_out[i] = in[i] * scale * weight[i];
+    }
+}
+
 float compute_max_error(const std::vector<float>& cpu_out,
                         const std::vector<float>& cuda_out, int n) {
   float max_err = 0.0f;
@@ -179,7 +232,7 @@ int main() {
   // size, eps);
   int test_iter = 10;
   for (int i = 0; i < test_iter; ++i) {
-    row_rmsnorm_f32_dim<<<grid, block>>>(d_input, d_weight, d_output, batch,
+    row_rmsnorm_f32_dim_simd<<<grid, block>>>(d_input, d_weight, d_output, batch,
                                          size, eps);
   }
   cudaEventRecord(stop_event);
